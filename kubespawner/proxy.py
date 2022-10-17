@@ -5,9 +5,9 @@ import string
 
 import escapism
 from jupyterhub.proxy import Proxy
-from jupyterhub.utils import exponential_backoff
+from jupyterhub.utils import exponential_backoff, maybe_future
 from kubernetes_asyncio import client
-from traitlets import Unicode
+from traitlets import Callable, Unicode
 
 from .clients import load_config, shared_client
 from .objects import make_ingress
@@ -188,6 +188,33 @@ class KubeIngressProxy(Proxy):
         """,
     )
 
+    modify_hook = Callable(
+        None,
+        allow_none=True,
+        config=True,
+        help="""
+        Callable to augment Endpoints, Service and Ingress objects before creating them.
+
+        Expects a callable that takes named arguments:
+
+           1. `proxy` - Current proxy object
+           2. `endpoint` - V1Endpoint object or `None`
+           3. `service` - V1Service object
+           4. `ingress` - V1Ingress object
+           5. `routespec` - route specification in format "/user/:user", "/user/:user/:servername", "/hub", "/services/:servicename"
+           6. `target` - URL there proxy should route to, e.g. `http://servername.svc.cluster.local:8888/user/someuser`
+           7. `data` - dict with parsed route specification, like {"user": "me", "servicename": ""}, {"services": "myservice"} or {"hub": true}
+
+        You should modify Endpoint, Service and Ingress, and return tuple `(endpoint, service, ingress)`.
+
+        This can be a coroutine if necessary. When set to none, no augmenting is done.
+
+        This is very useful if you want to modify the ingress being launched dynamically.
+        Note that the ingress object can change between versions of KubeIngressProxy and JupyterHub,
+        so be careful relying on this!
+        """,
+    )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         load_config(host=self.k8s_api_host, ssl_ca_cert=self.k8s_api_ssl_ca_cert)
@@ -250,6 +277,20 @@ class KubeIngressProxy(Proxy):
             safe_name, routespec, target, labels, data
         )
 
+        if self.modify_hook:
+            self.log.info("Applying KubeIngressProxy.modify_hook")
+            endpoint, service, ingress = await maybe_future(
+                self.modify_hook(
+                    proxy=self,
+                    endpoint=endpoint,
+                    service=service,
+                    ingress=ingress,
+                    routespec=routespec,
+                    target=target,
+                    data=data,
+                ),
+            )
+
         async def ensure_object(create_func, patch_func, body, kind):
             try:
                 await create_func(namespace=self.namespace, body=body)
@@ -289,18 +330,27 @@ class KubeIngressProxy(Proxy):
             )
             await self._delete_if_exists('endpoint', safe_name, delete_endpoint)
 
-        await ensure_object(
-            self.core_api.create_namespaced_service,
-            self.core_api.patch_namespaced_service,
-            body=service,
-            kind='service',
-        )
+        if service is not None:
+            await ensure_object(
+                self.core_api.create_namespaced_service,
+                self.core_api.patch_namespaced_service,
+                body=service,
+                kind='service',
+            )
 
-        await exponential_backoff(
-            lambda: f'{self.namespace}/{safe_name}'
-            in self.service_reflector.services.keys(),
-            'Could not find service/%s after creating it' % safe_name,
-        )
+            await exponential_backoff(
+                lambda: f'{self.namespace}/{safe_name}'
+                in self.service_reflector.services.keys(),
+                'Could not find service/%s after creating it' % safe_name,
+            )
+        else:
+            delete_options = client.V1DeleteOptions(grace_period_seconds=0)
+            delete_service = self.core_api.delete_namespaced_service(
+                name=safe_name,
+                namespace=self.namespace,
+                body=delete_options,
+            )
+            await self._delete_if_exists('service', safe_name, delete_service)
 
         await ensure_object(
             self.networking_api.create_namespaced_ingress,
